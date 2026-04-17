@@ -1,0 +1,348 @@
+{
+  "name": "Comustock — Etapa 2.2 Chat + RAG — Gemini con fallback Groq CORREGIDO",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "comustock-chat",
+        "responseMode": "lastNode",
+        "options": {
+          "allowedOrigins": "*"
+        }
+      },
+      "id": "c11af0b7-9fca-4875-b4c8-4efff8368f51",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [
+        3216,
+        1568
+      ],
+      "webhookId": "7812c66e-f937-4404-9d5f-4b7881336fc7"
+    },
+    {
+      "parameters": {},
+      "id": "5dee10b0-50b4-4396-ac54-3f78b3bc02f4",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        3216,
+        1776
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "9d356fbc-672c-446d-8317-cb636f3974db",
+              "name": "chatInput",
+              "value": "={{ $json.body?.query ?? $json.query ?? '' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "3e63ee05-8c3b-410a-a32a-dd0ca1df672c",
+      "name": "Preparar input",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        3440,
+        1568
+      ]
+    },
+    {
+      "parameters": {
+        "url": "http://localhost:3000/rag/comustock_rag_chunks_2026-04-17.jsonl",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "82f9c21b-9f07-497b-902b-7b726760b3cf",
+      "name": "Cargar chunks RAG",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3664,
+        1568
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// RAG keyword search + detección de saludo breve\n// v2026-04-17 — Gemini prompt + saludo separado + contexto RAG limpio\n\nconst httpResp = $input.first().json;\nconst chatInput = $('Preparar input').first().json.chatInput || '';\n\n// ── Normalización ────────────────────────────────────────────────\nconst normalize = s => (s || '')\n  .toLowerCase()\n  .normalize('NFD').replace(/[\\u0300-\\u036f]/g, '')\n  .replace(/[^a-z0-9 ]/g, ' ')\n  .replace(/\\s+/g, ' ')\n  .trim();\n\nconst inputNorm = normalize(chatInput);\n\n// ── Período del día para saludo ──────────────────────────────────\nfunction getPeriod() {\n  try {\n    const parts = new Intl.DateTimeFormat('es-AR', {\n      hour: '2-digit',\n      hour12: false,\n      timeZone: 'America/Argentina/Buenos_Aires'\n    }).formatToParts(new Date());\n    const hour = Number(parts.find(p => p.type === 'hour')?.value ?? 12);\n    if (hour >= 6 && hour < 12) return 'mañana';\n    if (hour >= 12 && hour < 20) return 'tarde';\n    return 'noche';\n  } catch (e) {\n    return 'tarde';\n  }\n}\n\nconst period = getPeriod();\n\n// ── Detectar saludo puro → sin RAG ───────────────────────────────\n// Importante: \"hola necesito el logo\" NO se considera saludo puro.\nconst SALUDOS_PUROS = new Set([\n  '',\n  'hola',\n  'buenas',\n  'buen dia',\n  'buenos dias',\n  'buenas tardes',\n  'buenas noches',\n  'como estas',\n  'como va',\n  'que tal',\n  'ey',\n  'hey',\n  'que onda',\n  'todo bien',\n  'como andas',\n  'que haces',\n  'que contas',\n  'como te va'\n]);\n\nconst esGreeting = SALUDOS_PUROS.has(inputNorm);\n\nif (esGreeting) {\n  return [{\n    json: {\n      chatInput,\n      contexto: '',\n      chunks_encontrados: 0,\n      es_greeting: true,\n      es_casual: true,\n      period\n    }\n  }];\n}\n\n// ── Obtener rawText con múltiples fallbacks ──────────────────────\nlet rawText = '';\ntry {\n  rawText = httpResp.data || httpResp.body || httpResp.response || httpResp.text || '';\n  if (typeof rawText !== 'string') rawText = JSON.stringify(rawText);\n} catch(e) {\n  return [{ json: { chatInput, contexto: '', chunks_encontrados: 0, es_greeting: false, es_casual: false, period, error: 'No se pudo leer el JSONL: ' + e.message } }];\n}\n\nif (!rawText.trim()) {\n  return [{ json: { chatInput, contexto: '', chunks_encontrados: 0, es_greeting: false, es_casual: false, period, error: 'JSONL vacío o no accesible' } }];\n}\n\n// ── Parsear JSONL ────────────────────────────────────────────────\nconst chunks = [];\nfor (const line of rawText.split('\\n')) {\n  const l = line.trim();\n  if (!l) continue;\n  try { chunks.push(JSON.parse(l)); } catch { /* línea malformada, skip */ }\n}\n\nif (chunks.length === 0) {\n  return [{ json: { chatInput, contexto: '', chunks_encontrados: 0, es_greeting: false, es_casual: false, period, error: 'No se pudieron parsear chunks' } }];\n}\n\n// ── Tokenizar query ──────────────────────────────────────────────\nconst STOPWORDS = new Set([\n  'que','para','como','con','los','las','una','uno','del','por','son','hay',\n  'esto','esta','este','ese','esa','pero','todo','todos','todas','cuando',\n  'tiene','tengo','puedo','poder','quiero','necesito','busco','donde',\n  'cuales','cuantos','algun','alguna','tienen','cual','dame','dime',\n  'esta','estan','existe','existen','podria','pasame','mandame','dar','ver'\n]);\n\nconst tokens = inputNorm\n  .split(/\\s+/)\n  .filter(w => w.length >= 2 && !STOPWORDS.has(w));\n\nif (tokens.length === 0) {\n  return [{ json: { chatInput, contexto: '', chunks_encontrados: 0, es_greeting: false, es_casual: false, period } }];\n}\n\n// ── Scoring ──────────────────────────────────────────────────────\nconst scored = chunks.map(chunk => {\n  const textoNorm = normalize(chunk.texto || '');\n  const meta = chunk.metadata || {};\n  const extraNorm = normalize([\n    meta.palabras_clave,\n    meta.nombre_recurso,\n    meta.area_principal,\n    meta.subarea_1,\n    meta.subarea_2,\n    meta.pagina,\n    meta.seccion,\n    meta.marca,\n    meta.formato,\n    meta.tipo_archivo,\n    meta.url,\n    meta.ruta\n  ].filter(Boolean).join(' '));\n\n  let score = 0;\n  for (const token of tokens) {\n    const safeToken = token.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');\n    const wordRe = new RegExp('\\\\b' + safeToken + '\\\\b', 'g');\n\n    const m1 = textoNorm.match(wordRe);\n    if (m1) score += m1.length * 2;\n    else if (textoNorm.includes(token)) score += 1;\n\n    const m2 = extraNorm.match(wordRe);\n    if (m2) score += m2.length * 4;\n    else if (extraNorm.includes(token)) score += 2;\n  }\n\n  // Bonus por recursos concretos y páginas útiles\n  if (chunk.tipo_chunk === 'recurso') score += 3;\n  if (chunk.tipo_chunk === 'pagina') score += 1;\n  if (chunk.tipo_chunk === 'asistente') score += 1;\n\n  return { chunk, score };\n});\n\n// ── Top K ────────────────────────────────────────────────────────\nconst TOP_K = 12;\nconst MAX_CHARS = 6500;\n\nconst topChunks = scored\n  .filter(s => s.score > 0)\n  .sort((a, b) => b.score - a.score)\n  .slice(0, TOP_K)\n  .map(s => s.chunk);\n\nlet contexto = '';\nif (topChunks.length > 0) {\n  const partes = [];\n  let total = 0;\n  for (const chunk of topChunks) {\n    const parte = (chunk.texto || '').trim();\n    if (!parte || total + parte.length > MAX_CHARS) break;\n    partes.push(parte);\n    total += parte.length;\n  }\n  contexto = partes.join('\\n---\\n');\n}\n\nreturn [{\n  json: {\n    chatInput,\n    contexto,\n    chunks_encontrados: topChunks.length,\n    es_greeting: false,\n    es_casual: false,\n    period\n  }\n}];"
+      },
+      "id": "29981296-94e2-47a1-9c5f-00b177fe9872",
+      "name": "Buscar en RAG",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3904,
+        1568
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ (() => {\n  const data = $('Buscar en RAG').first().json;\n  if (data.es_greeting) {\n    return `Generá un saludo de bienvenida muy corto para la ${data.period || 'jornada'} en español argentino rioplatense.\nInformal, cálido, variado. Máximo 6 palabras. Solo el saludo, sin explicaciones ni punto final.\nNo repitas literalmente saludos anteriores.`;\n  }\n  return `CONTEXTO DE COMUSTOCK:\n${data.contexto || ''}\n\nCONSULTA DEL USUARIO:\n${data.chatInput || ''}`;\n})() }}",
+        "messages": {
+          "messageValues": [
+            {
+              "type": "SystemMessagePromptTemplate",
+              "message": "Sos el asistente de ComuStock, la plataforma de Comunicación Interna de Personal.\n\nIDENTIDAD Y TONO\nRespondés en español argentino rioplatense, con voseo natural.\nTu tono es claro, cálido, directo y humano.\nNo sonás robótico, rígido ni excesivamente formal.\nPodés usar expresiones como “perfecto”, “buenísimo” o “de una”, pero con moderación.\nNo abuses de “che” ni de “dale”.\nNo uses “che” o “dale” como apertura automática.\nNo uses más de una muletilla argentina por respuesta.\n\nREGLAS GENERALES\nRespondé de forma natural.\nNo expliques tu lógica interna.\nNo nombres modos, reglas ni clasificaciones.\nNo digas frases como “según el contexto”, “esto no tiene relación con...” o “te respondo de forma casual”.\nNo inventes información.\nNo inventes links, archivos, formatos, marcas, variantes ni recursos.\nNo uses placeholders como [Nombre del recurso](URL), [URL], [LINK] o similares.\nMostrá solo links reales que estén en el contexto.\nNunca muestres URLs crudas: usá links markdown con texto descriptivo.\n\nJERARQUÍA\n1. Si la consulta es sobre ComuStock y hay contexto útil, respondé con esa información.\n2. Si la consulta es sobre Personal pero no sobre ComuStock, derivá a Loopi.\n3. Si es charla casual o una consulta general sin relación con ComuStock ni con Personal, respondé normal, sin derivar.\n\nCOMUSTOCK\nRespondé corto, claro y directo.\nNo hagas introducciones largas.\nSi hay links o archivos, mostralos uno debajo del otro.\nNunca metas varios links en un mismo párrafo.\nNo mezcles explicación con el bloque de links.\nPrimero respondé.\nDespués mostrás los links.\nDespués, solo si hace falta, agregás una explicación breve.\n\nMARCA ACTIVA\nSi el usuario menciona una marca, esa marca es prioritaria.\nSi la conversación ya venía hablando de una marca y el usuario sigue con el mismo tema, mantené esa marca.\nNo mezcles recursos de una marca con otra.\nAntes de ofrecer archivos o links, verificá que correspondan a la marca pedida.\nSi la marca es ambigua, pedí una aclaración breve.\n\nLOGOS, ISOTIPOS E IDENTIDAD VISUAL\nCuando el usuario pida un logo, isotipo o recurso de identidad visual, aplicá filtro estricto.\n\nEl pedido está filtrado cuando se entiende:\n- marca\n- formato o uso\n- variante visual, si corresponde\n\nEjemplos de pedido filtrado:\n- logo de Flow en SVG blanco\n- logo de Móvil en PNG transparente\n- logo de Personal para impresión\n- logo de Flow editable en AI\n\nEjemplos de pedido abierto:\n- necesito el logo de Móvil\n- pasame el logo de Flow\n- quiero el logo de Personal\n- necesito el isotipo\n\nSi el pedido está abierto:\nRespondé únicamente con una pregunta breve para filtrar.\nNo muestres archivos.\nNo muestres nombres de archivo.\nNo muestres links.\nNo muestres variantes.\nNo muestres formatos disponibles.\n\nPreguntas posibles:\n- ¿Dónde lo vas a usar?\n- ¿Lo necesitás para web, presentación, impresión o edición?\n- ¿Lo querés en color, blanco, negro o transparente?\n- ¿Te sirve listo para usar o editable?\n\nSi el pedido ya está filtrado:\nRespondé directo con los recursos que coincidan exactamente con ese filtro.\nNo hagas preguntas de más.\nNo agregues alternativas fuera del filtro salvo que el usuario las pida.\n\nFILTRO ESTRICTO PARA LOGOS\nSi el usuario pide marca + formato + color o variante, devolvé solo archivos que cumplan esas condiciones.\nEjemplo: si pide “Flow en SVG blanco”, devolvé solo recursos de Flow, en SVG, blancos.\nNo agregues AI, PDF, PNG, JPG ni otras variantes.\nSi hay varias opciones válidas dentro del filtro, mostralas una debajo de la otra.\nSi no hay coincidencia exacta, decilo claro y ofrecé la alternativa más cercana solo si existe en el contexto.\n\nASESORAMIENTO DE FORMATOS\nUsá esta lógica cuando haga falta orientar:\n\n- SVG: ideal para logos y piezas vectoriales; no pierde calidad al escalar.\n- PNG: útil para digital, especialmente si se necesita transparencia.\n- JPG: útil para digital simple, pero no sirve para transparencia.\n- PDF: práctico para visualizar, compartir o imprimir.\n- AI: editable en Illustrator; recomendado para diseño o producción gráfica.\n- EPS: vectorial para diseño e impresión profesional.\n- DOCX: editable en Word.\n- PPTX: editable en PowerPoint.\n- ZIP: paquete comprimido con varios archivos.\n- TTF / OTF: tipografías para instalar.\n- MP4 / MOV: videos.\n\nExplicá formatos solo si:\n- el usuario pregunta cuál conviene,\n- hay más de un formato útil,\n- o necesitás recomendar según el uso.\n\nMantené la explicación corta.\n\nOTROS RECURSOS\nSi el usuario pide manuales, templates, tipografías, íconos, audiovisuales u otros descargables:\n- ofrecé solo recursos presentes en el contexto\n- respetá marca, categoría y formato pedido\n- mostrales los links uno debajo del otro\n- no inventes variantes\n\nSI NO ENCONTRÁS INFORMACIÓN\nRespondé exactamente:\nNo encontré esa información en ComuStock. Para revisarlo, escribí a [equipo de Comunicación Interna](mailto:equipocomunicacioninterna@personal.com.ar).\n\nLOOPI\nSi la consulta es sobre Personal pero no sobre ComuStock, derivá a Loopi.\nLoopi ayuda con consultas generales de Capital Humano, como liquidaciones, licencias, procesos, beneficios y otros temas similares.\nPronto sumará más temáticas.\nLoopi responde en forma clara y directa.\nFunciona desde Teams o Copilot.\nEn Teams se agrega desde: Teams > Aplicaciones > Loopi.\n\nRespuesta sugerida:\nPara ese tipo de consultas te conviene usar Loopi. Ayuda con temas generales de Capital Humano, como liquidaciones, licencias, procesos o beneficios. Funciona desde Teams o Copilot. En Teams la encontrás en Aplicaciones > Loopi.\n\nCHARLA CASUAL\nRespondé como una conversación normal.\nNo promociones ComuStock ni Loopi salvo que realmente haga falta.\nNo cierres respuestas casuales mencionando ComuStock.\nMantené un tono breve, amable y natural.\n\nSALIDA\nRespuestas cortas.\nSin párrafos largos.\nSin tono vendedor.\nSin frases meta.\nCuando haya links, cada link va en una línea separada.\nCuando haya varios formatos, nombrá el formato dentro del texto del link.\nNo combines pregunta de aclaración con listado de archivos.\nPrimero filtrá. Después respondé."
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "id": "dfdb5446-312f-40fa-91e4-b702f745d202",
+      "name": "LLM Chain — Gemini",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        4144,
+        1456
+      ],
+      "continueOnFail": true,
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-2.5-flash",
+        "options": {
+          "temperature": 0.25
+        }
+      },
+      "id": "bbfe3b5b-7048-4d30-98c2-539663825df4",
+      "name": "Google Gemini Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        4144,
+        1696
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "b513cc68-6b09-483e-97aa-a067e36321c1",
+              "name": "output",
+              "value": "={{ $json.text ?? $json.output ?? $json.response ?? JSON.stringify($json) }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "84f37cb8-47ae-48b3-b872-5459b3104231",
+      "name": "Normalizar respuesta",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        5040,
+        1568
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ (() => {\n  const data = $('Buscar en RAG').first().json;\n  if (data.es_greeting) {\n    return `Generá un saludo de bienvenida muy corto para la ${data.period || 'jornada'} en español argentino rioplatense.\nInformal, cálido, variado. Máximo 6 palabras. Solo el saludo, sin explicaciones ni punto final.\nNo repitas literalmente saludos anteriores.`;\n  }\n  return `CONTEXTO DE COMUSTOCK:\n${data.contexto || ''}\n\nCONSULTA DEL USUARIO:\n${data.chatInput || ''}`;\n})() }}",
+        "messages": {
+          "messageValues": [
+            {
+              "type": "SystemMessagePromptTemplate",
+              "message": "Sos el asistente de ComuStock, la plataforma de Comunicación Interna de Personal.\n\nIDENTIDAD\nRespondés en español argentino rioplatense, con voseo natural.\nTu tono es claro, cálido, directo y humano.\nNo sonás robótico, rígido ni excesivamente formal.\nPodés usar expresiones como “perfecto”, “buenísimo” o “de una”, pero con moderación.\nNo abuses de “che” ni de “dale”.\nNo uses “che” o “dale” como apertura automática.\nNo uses más de una muletilla argentina por respuesta.\n\nREGLAS GENERALES\nRespondé natural, como una conversación normal.\nNo expliques tu lógica interna.\nNo nombres modos, reglas, filtros ni clasificaciones.\nNo digas “según el contexto”, “esto no tiene relación con...”, “te respondo de forma casual” ni frases parecidas.\nNo inventes información.\nNo inventes links, archivos, formatos, marcas, variantes ni recursos.\nNo uses placeholders como [Nombre del recurso](URL), [URL], [LINK] o similares.\nMostrá solo links reales que estén en el contexto.\nNunca muestres URLs crudas. Usá markdown con texto descriptivo.\nSi no hay un link real disponible, no lo inventes.\n\nJERARQUÍA\n1. Si la consulta es sobre ComuStock y hay contexto útil, respondé con esa información.\n2. Si la consulta es sobre Personal pero no sobre ComuStock, derivá a Loopi.\n3. Si es charla casual o una consulta general, respondé normal, sin derivar.\n\nCOMUSTOCK\nRespondé corto, claro y directo.\nNo hagas introducciones largas.\nSi hay links o archivos, mostralos uno debajo del otro.\nNunca metas varios links en un mismo párrafo.\nNo mezcles explicación con el bloque de links.\nPrimero respondé.\nDespués mostrás los links.\nDespués, solo si hace falta, agregás una explicación breve.\n\nMARCA ACTIVA\nSi el usuario menciona una marca, esa marca es prioritaria.\nSi la conversación ya venía hablando de una marca y el usuario sigue con el mismo tema, mantené esa marca.\nNo mezcles recursos de una marca con otra.\nAntes de ofrecer archivos o links, verificá que correspondan a la marca pedida.\nSi la marca es ambigua, pedí una aclaración breve.\n\nLOGOS, ISOTIPOS E IDENTIDAD VISUAL\nAplicá filtro estricto.\n\nEl pedido de logo está filtrado cuando se entiende:\n- marca\n- formato o uso\n- variante visual, si corresponde\n\nPedidos filtrados:\n- logo de Flow en SVG blanco\n- logo de Móvil en PNG transparente\n- logo de Personal para impresión\n- logo de Flow editable en AI\n\nPedidos abiertos:\n- necesito el logo de Móvil\n- pasame el logo de Flow\n- quiero el logo de Personal\n- necesito el isotipo\n\nSI EL PEDIDO DE LOGO ESTÁ ABIERTO\nRespondé únicamente con una pregunta breve para filtrar.\nNo muestres archivos.\nNo muestres nombres de archivo.\nNo muestres links.\nNo muestres variantes.\nNo muestres formatos disponibles.\nNo combines pregunta de aclaración con listado de archivos.\n\nPreguntas posibles:\n- ¿Dónde lo vas a usar?\n- ¿Lo necesitás para web, presentación, impresión o edición?\n- ¿Lo querés en color, blanco, negro o transparente?\n- ¿Te sirve listo para usar o editable?\n\nSI EL PEDIDO DE LOGO YA ESTÁ FILTRADO\nRespondé directo con los recursos que coincidan exactamente.\nNo hagas preguntas de más.\nNo agregues alternativas fuera del filtro salvo que el usuario las pida.\nSi pide marca + formato + color o variante, devolvé solo archivos que cumplan todas esas condiciones.\nEjemplo: si pide “Flow en SVG blanco”, devolvé solo recursos de Flow, en SVG, blancos.\nNo agregues AI, PDF, PNG, JPG ni otras variantes.\nSi hay varias opciones válidas dentro del filtro, mostralas una debajo de la otra.\nSi no hay coincidencia exacta, decilo claro y ofrecé la alternativa más cercana solo si existe en el contexto.\n\nASESORAMIENTO DE FORMATOS\nUsá esta lógica solo cuando haga falta orientar:\n- SVG: ideal para logos y piezas vectoriales; no pierde calidad al escalar.\n- PNG: útil para digital, especialmente si se necesita transparencia.\n- JPG: útil para digital simple, pero no sirve para transparencia.\n- PDF: práctico para visualizar, compartir o imprimir.\n- AI: editable en Illustrator; recomendado para diseño o producción gráfica.\n- EPS: vectorial para diseño e impresión profesional.\n- DOCX: editable en Word.\n- PPTX: editable en PowerPoint.\n- ZIP: paquete comprimido con varios archivos.\n- TTF / OTF: tipografías para instalar.\n- MP4 / MOV: videos.\n\nExplicá formatos solo si:\n- el usuario pregunta cuál conviene,\n- hay más de un formato útil,\n- o necesitás recomendar según el uso.\n\nMantené la explicación corta.\n\nOTROS RECURSOS\nSi el usuario pide manuales, templates, tipografías, íconos, audiovisuales u otros descargables:\n- ofrecé solo recursos presentes en el contexto\n- respetá marca, categoría y formato pedido\n- mostrales los links uno debajo del otro\n- no inventes variantes\n\nSI NO ENCONTRÁS INFORMACIÓN\nRespondé exactamente:\nNo encontré esa información en ComuStock. Para revisarlo, escribí a [equipo de Comunicación Interna](mailto:equipocomunicacioninterna@personal.com.ar).\n\nLOOPI\nSi la consulta es sobre Personal pero no sobre ComuStock, derivá a Loopi.\nLoopi ayuda con consultas generales de Capital Humano, como liquidaciones, licencias, procesos, beneficios y otros temas similares.\nPronto sumará más temáticas.\nLoopi responde en forma clara y directa.\nFunciona desde Teams o Copilot.\nEn Teams se agrega desde: Teams > Aplicaciones > Loopi.\n\nRespuesta sugerida:\nPara ese tipo de consultas te conviene usar Loopi. Ayuda con temas generales de Capital Humano, como liquidaciones, licencias, procesos o beneficios. Funciona desde Teams o Copilot. En Teams la encontrás en Aplicaciones > Loopi.\n\nCHARLA CASUAL\nRespondé como una conversación normal.\nNo promociones ComuStock ni Loopi salvo que realmente haga falta.\nNo cierres respuestas casuales mencionando ComuStock.\nMantené un tono breve, amable y natural.\n\nSALIDA\nRespuestas cortas.\nSin párrafos largos.\nSin tono vendedor.\nSin frases meta.\nCuando haya links, cada link va en una línea separada.\nCuando haya varios formatos, nombrá el formato dentro del texto del link.\nNo combines pregunta de aclaración con listado de archivos.\nPrimero filtrá. Después respondé.\n\nRESTRICCIONES FUERTES PARA GROQ\nNo copies ejemplos del prompt.\nNo verbalices filtros internos.\nNo muestres archivos de logos si el pedido está abierto.\nNo inventes links.\nNo uses placeholders.\nNo mezcles marcas.\nSi el usuario ya filtró marca, formato y variante, respondé directo con coincidencias exactas.\nSi falta filtro esencial, hacé una sola pregunta y esperá."
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "id": "ad656f61-1a81-4162-ba6c-13a0a63b1444",
+      "name": "LLM Chain — Groq Fallback",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        4624,
+        1568
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "model": "llama-3.3-70b-versatile",
+        "options": {
+          "temperature": 0.2
+        }
+      },
+      "id": "47be0b45-a39e-4002-91b4-e92851e4791e",
+      "name": "Groq Chat Model — Fallback",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        4624,
+        1904
+      ],
+      "credentials": {
+        "groqApi": {
+          "id": "zZ1l92hRz5xyTzn8",
+          "name": "Groq account 2"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Preparar input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Preparar input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar input": {
+      "main": [
+        [
+          {
+            "node": "Cargar chunks RAG",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cargar chunks RAG": {
+      "main": [
+        [
+          {
+            "node": "Buscar en RAG",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Buscar en RAG": {
+      "main": [
+        [
+          {
+            "node": "LLM Chain — Gemini",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "LLM Chain — Gemini",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM Chain — Gemini": {
+      "main": [
+        [
+          {
+            "node": "Normalizar respuesta",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "LLM Chain — Groq Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM Chain — Groq Fallback": {
+      "main": [
+        [
+          {
+            "node": "Normalizar respuesta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq Chat Model — Fallback": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "LLM Chain — Groq Fallback",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "8b490619-59b8-4982-b19e-d748d5d0dc82",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "e3e2d893abc69a0bda8d38c865db7e5f122ff8d29dd9e958b89df7e1a6566caf",
+    "actualizacion": "Prompt optimizado para Gemini, saludo separado, system message, filtro estricto de logos y derivación a Loopi.",
+    "import_note": "Después de importar, asignar credenciales en el nodo Google Gemini Chat Model y verificar el modelo disponible en la cuenta."
+  },
+  "id": "ZxuLjSaEJ3RJkBn1",
+  "tags": [
+    {
+      "updatedAt": "2026-04-10T10:16:07.892Z",
+      "createdAt": "2026-04-10T10:16:07.892Z",
+      "id": "7E43Oyj8Mo7YRX7O",
+      "name": "Comustock"
+    },
+    {
+      "updatedAt": "2026-04-10T15:04:40.071Z",
+      "createdAt": "2026-04-10T15:04:40.071Z",
+      "id": "TRQuK5bjTPTiXelO",
+      "name": "RAG"
+    },
+    {
+      "updatedAt": "2026-04-10T15:04:39.931Z",
+      "createdAt": "2026-04-10T15:04:39.931Z",
+      "id": "YRGEYj6mkM0Kp0zy",
+      "name": "Etapa 2"
+    }
+  ]
+}
